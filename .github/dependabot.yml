@@ -1,16 +1,21 @@
+# Dependabot runs once a month on day 6 at 01:05 (Europe/Berlin), not on the 1st like every other
+# repository - that spreads the load on the GitHub systems and avoids the delays of the monthly peak.
 version: 2
 updates:
     - package-ecosystem: github-actions
       directory: '/'
       schedule:
-          interval: monthly
-          time: '04:00'
+          interval: cron
+          cronjob: '5 1 6 * *'
           timezone: Europe/Berlin
+      open-pull-requests-limit: 15
     - package-ecosystem: npm
-      directory: '/'
+      # both package.json files (repository root and src-admin) must be scanned
+      directories:
+          - '**/*'
       schedule:
-          interval: monthly
-          time: '04:00'
+          interval: cron
+          cronjob: '5 1 6 * *'
           timezone: Europe/Berlin
       open-pull-requests-limit: 20
       versioning-strategy: increase

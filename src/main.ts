@@ -6,6 +6,7 @@ import { sendResponse, sortByTs } from '@iobroker/aggregate';
 import DatabaseInfluxDB1x from './lib/DatabaseInfluxDB1x';
 import DatabaseInfluxDB2x from './lib/DatabaseInfluxDB2x';
 import { escapeFluxString, escapeInfluxQLIdentifier, type Database, type ValuesForInflux } from './lib/Database';
+import { formatError, isConnectionError, UnstorableValueError } from './lib/errors';
 import type {
     GetHistoryOptions,
     InfluxDBAdapterConfig,
@@ -22,6 +23,9 @@ const dockerDefaultToken = Buffer.from('iobroker86645638546565652656').toString(
 
 /** Maximal number of entries one `getRawEntries` call may return */
 const MAX_RAW_ENTRIES = 2000;
+
+// While the database stays unreachable, remind about it at most once an hour instead of on every retry
+const REPEATED_ERROR_INTERVAL = 3_600_000;
 /** Oldest timestamp the data browser looks at. The adapter never writes a point before the epoch */
 const MIN_INFLUX_TIME = 0;
 /** Newest timestamp a Flux range may stop at. InfluxDB cannot store anything after it */
@@ -71,23 +75,6 @@ function isObject(it: any): boolean {
     // typeof [] === 'object'
     // [] instanceof Object === true
     return Object.prototype.toString.call(it) === '[object Object]';
-}
-
-function extractError(error: any): string {
-    if (typeof error === 'string') {
-        return error;
-    }
-    if (error instanceof Error) {
-        if (Array.isArray((error as any).errors) && (error as any).errors.length) {
-            return (error as any).errors.map((e: any) => (e.message ? e.message : JSON.stringify(e))).join(', ');
-        }
-        return error.message;
-    }
-    if (error === null || error === undefined) {
-        return 'null';
-    }
-
-    return error.toString();
 }
 
 function parseBool(value: any, defaultValue?: boolean): boolean {
@@ -204,7 +191,12 @@ export class InfluxDBAdapter extends Adapter {
     private _finished = false;
     // mapping from ioBroker ID to Alias ID
     private readonly _aliasMap: { [ioBrokerId: string]: string } = {};
+    // IDs (plus the reason) that were already reported as "value can not be stored", see logSkipOnce()
     private readonly _warnedValueIDs: Set<string> = new Set();
+    // Last connection error, so a database that is switched off does not repeat the same line forever
+    private _lastConnectionError = '';
+    private _lastConnectionErrorTs = 0;
+    private _connectionErrorCount = 0;
     // Per-instance cache file (must NOT be a module global, otherwise instances collide in compact mode)
     private _cacheFile = join(dataDir, 'influxdata.json');
 
@@ -339,6 +331,74 @@ export class InfluxDBAdapter extends Adapter {
         }
     }
 
+    /**
+     * Log a connection error without flooding the log.
+     *
+     * A database that is simply switched off makes every write and every reconnect fail, so the very same
+     * line would otherwise be written hundreds of times per minute (and into syslog as well). The first
+     * occurrence is logged as error, repetitions of the identical message go to debug, and once an hour a
+     * reminder is logged that the database is still unreachable.
+     *
+     * @param error error to report
+     * @param prefix optional text in front of the error message
+     */
+    logConnectionError(error: unknown, prefix?: string): void {
+        const text = `${prefix ? `${prefix}: ` : ''}${formatError(error)}`;
+        const now = Date.now();
+
+        if (text === this._lastConnectionError) {
+            this._connectionErrorCount++;
+            if (now - this._lastConnectionErrorTs >= REPEATED_ERROR_INTERVAL) {
+                this._lastConnectionErrorTs = now;
+                this.log.error(`${text} (still failing, ${this._connectionErrorCount} attempts)`);
+            } else {
+                this.log.debug(`${text} (attempt ${this._connectionErrorCount})`);
+            }
+        } else {
+            this._lastConnectionError = text;
+            this._lastConnectionErrorTs = now;
+            this._connectionErrorCount = 1;
+            this.log.error(text);
+        }
+    }
+
+    /**
+     * Report a value that InfluxDB can not store - once per datapoint and reason.
+     *
+     * Adapters that deliver `null`, `NaN` or a string for a number datapoint do so on every update (some
+     * every two seconds), and the value is skipped every time. Logging that on every state change makes
+     * the ioBroker log unusable, so the first occurrence is logged and the repetitions go to debug.
+     *
+     * @param id datapoint the value belongs to
+     * @param error the error thrown by pushHelper()
+     */
+    logSkipOnce(id: string, error: UnstorableValueError): void {
+        const key = `${error.kind}:${id}`;
+        if (this._warnedValueIDs.has(key)) {
+            this.log.debug(error.message);
+            return;
+        }
+        this._warnedValueIDs.add(key);
+        this.log.info(`${error.message} (this message is logged only once per datapoint)`);
+    }
+
+    /**
+     * Log whatever came out of a write: connection errors and unstorable values are throttled, everything
+     * else is a real problem and is logged as before.
+     *
+     * @param id datapoint the value belongs to
+     * @param error the caught error
+     */
+    logPushError(id: string, error: unknown): void {
+        if (error instanceof UnstorableValueError) {
+            this.logSkipOnce(id, error);
+        } else if (isConnectionError(error)) {
+            this.logConnectionError(error, `Cannot write value of ${id}`);
+        } else {
+            this.log.warn(`Cannot write value of ${id}: ${formatError(error)}`);
+        }
+    }
+
     reconnect(): void {
         this.setConnected(false);
         this.stopPing();
@@ -371,7 +431,7 @@ export class InfluxDBAdapter extends Adapter {
                     this.log.debug('PING OK');
                 }
             } catch (error) {
-                this.log.error(`Error during ping: ${extractError(error)}. Attempting reconnect.`);
+                this.logConnectionError(error, 'Error during ping, attempting reconnect');
                 this.reconnect();
             }
         }
@@ -473,7 +533,7 @@ export class InfluxDBAdapter extends Adapter {
                 await this._client.applyRetentionPolicyToDB(this.config.dbname, this.config.retention as number);
             } catch (error) {
                 // Ignore issues with creating/altering retention policy, as it might be due to insufficient permissions
-                this.log.warn(extractError(error));
+                this.log.warn(formatError(error));
             }
 
             if (this.config.dbversion === '2.x') {
@@ -489,7 +549,9 @@ export class InfluxDBAdapter extends Adapter {
                 this.startPing();
             }
         } catch (error) {
-            this.log.error(extractError(error));
+            // The reconnect loop retries forever, so an unreachable database must not repeat the same
+            // line every reconnectInterval - that is what fills the log (and syslog) of a stopped DB.
+            this.logConnectionError(error, 'Cannot connect to InfluxDB');
             this.reconnect();
         }
     }
@@ -513,7 +575,14 @@ export class InfluxDBAdapter extends Adapter {
                 this.startPing();
             }
         } catch (error) {
-            this.log.error(`Error checking for metadata storage type: ${extractError(error)}`);
+            if (isConnectionError(error)) {
+                // Without this the adapter would stay disconnected: the outer connect() already
+                // returned, so nobody else schedules a new attempt.
+                this.logConnectionError(error, 'Error checking for metadata storage type');
+                this.reconnect();
+            } else {
+                this.log.error(`Error checking for metadata storage type: ${formatError(error)}`);
+            }
         }
     }
 
@@ -531,7 +600,7 @@ export class InfluxDBAdapter extends Adapter {
             const result = await this._client?.getRetentionPolicyForDB(this.config.dbname);
             this.sendTo(msg.from, msg.command, { result }, msg.callback);
         } catch (error) {
-            this.sendTo(msg.from, msg.command, { error: extractError(error) }, msg.callback);
+            this.sendTo(msg.from, msg.command, { error: formatError(error) }, msg.callback);
         }
     }
 
@@ -696,14 +765,14 @@ export class InfluxDBAdapter extends Adapter {
                 if (timeout) {
                     clearTimeout(timeout);
                     timeout = null;
-                    return this.sendTo(msg.from, msg.command, { error: extractError(error) }, msg.callback);
+                    return this.sendTo(msg.from, msg.command, { error: formatError(error) }, msg.callback);
                 }
             }
             if (dockerCreated && dockerManager) {
                 try {
                     await dockerManager.destroy();
                 } catch (e) {
-                    this.log.error(`Cannot stop docker container: ${extractError(e)}`);
+                    this.log.error(`Cannot stop docker container: ${formatError(e)}`);
                 }
             }
         } catch (error) {
@@ -711,7 +780,9 @@ export class InfluxDBAdapter extends Adapter {
                 clearTimeout(timeout);
                 timeout = null;
             }
-            if (extractError(error) === 'TypeError: undefined is not a function') {
+            // The driver package is loaded lazily, and a missing one shows up as a TypeError here.
+            // (Comparing the formatted text would break as soon as the wording changes.)
+            if (error instanceof TypeError && error.message.includes('undefined is not a function')) {
                 this.sendTo(
                     msg.from,
                     msg.command,
@@ -720,7 +791,7 @@ export class InfluxDBAdapter extends Adapter {
                 );
                 return;
             }
-            this.sendTo(msg.from, msg.command, { error: extractError(error) }, msg.callback);
+            this.sendTo(msg.from, msg.command, { error: formatError(error) }, msg.callback);
         }
     }
 
@@ -755,7 +826,7 @@ export class InfluxDBAdapter extends Adapter {
                     await this._client.applyRetentionPolicyToDB(this.config.dbname, this.config.retention as number);
                 } catch (error) {
                     // Ignore issues with creating/altering retention policy, as it might be due to insufficient permissions
-                    this.log.warn(extractError(error));
+                    this.log.warn(formatError(error));
                 }
 
                 if (this.config.dbversion === '2.x') {
@@ -764,7 +835,7 @@ export class InfluxDBAdapter extends Adapter {
                 this.sendTo(msg.from, msg.command, { error: null }, msg.callback);
             }
         } catch (error) {
-            this.sendTo(msg.from, msg.command, { error: extractError(error) }, msg.callback);
+            this.sendTo(msg.from, msg.command, { error: formatError(error) }, msg.callback);
         }
     }
 
@@ -836,7 +907,7 @@ export class InfluxDBAdapter extends Adapter {
                     }
                 } catch (error) {
                     if (msg.callback) {
-                        this.sendTo(msg.from, msg.command, { error: extractError(error) }, msg.callback);
+                        this.sendTo(msg.from, msg.command, { error: formatError(error) }, msg.callback);
                     }
                 }
             } else if (msg.command === 'enableHistory') {
@@ -860,9 +931,9 @@ export class InfluxDBAdapter extends Adapter {
                 await this.getRawEntries(msg);
             }
         } catch (error) {
-            this.log.error(`Cannot process message ${msg.command}: ${extractError(error)}`);
+            this.log.error(`Cannot process message ${msg.command}: ${formatError(error)}`);
             if (msg.callback) {
-                this.sendTo(msg.from, msg.command, { error: extractError(error) }, msg.callback);
+                this.sendTo(msg.from, msg.command, { error: formatError(error) }, msg.callback);
             }
         }
     }
@@ -1046,7 +1117,7 @@ export class InfluxDBAdapter extends Adapter {
             this._seriesBufferChecker = setInterval(() => {
                 this._seriesBufferFlushPlanned = true;
                 void this.storeBufferedSeries().catch(e =>
-                    this.log.error(`Cannot store buffered series: ${extractError(e)}`),
+                    this.log.error(`Cannot store buffered series: ${formatError(e)}`),
                 );
             }, this.config.seriesBufferFlushInterval * 1000);
         }
@@ -1103,7 +1174,13 @@ datasources:
             }
 
             if (state && state.val === undefined) {
-                this.log.warn(`state value undefined received for ${id} which is not allowed. Ignoring.`);
+                this.logSkipOnce(
+                    id,
+                    new UnstorableValueError(
+                        'null',
+                        `state value undefined received for ${id} which is not allowed. Ignoring.`,
+                    ),
+                );
                 return;
             }
 
@@ -1279,7 +1356,7 @@ datasources:
                     try {
                         await this.pushHelper(id, this._influxDPs[id].skipped);
                     } catch (e) {
-                        this.log.warn(`Cannot push skipped value: ${e}`);
+                        this.logPushError(id, e);
                     }
                     this._influxDPs[id].skipped = null;
                 }
@@ -1306,7 +1383,7 @@ datasources:
                             this.log.debug(
                                 `Value logged ${id}, value=${this._influxDPs[id].state.val}, ts=${this._influxDPs[id].state.ts}`,
                             );
-                        void this.pushHelper(id).catch(e => this.log.warn(e));
+                        void this.pushHelper(id).catch(e => this.logPushError(id, e));
                         if (settings.changesOnly && settings.changesRelogInterval > 0) {
                             this._influxDPs[id].relogTimeout = setTimeout(
                                 _id => this.reLogHelper(_id),
@@ -1330,7 +1407,7 @@ datasources:
                         `Value logged ${id}, value=${this._influxDPs[id].state!.val}, ts=${this._influxDPs[id].state!.ts}`,
                     );
                 }
-                void this.pushHelper(id, state).catch(e => this.log.warn(e));
+                void this.pushHelper(id, state).catch(e => this.logPushError(id, e));
                 if (settings.changesOnly && settings.changesRelogInterval > 0) {
                     this._influxDPs[id].relogTimeout = setTimeout(
                         _id => this.reLogHelper(_id),
@@ -1367,7 +1444,7 @@ datasources:
                     await this.pushHistory(_id, this._influxDPs[_id].state, true);
                 }
             } catch (error) {
-                this.log.info(`init timed Relog: can not get State for ${_id}: ${extractError(error)}`);
+                this.log.info(`init timed Relog: can not get State for ${_id}: ${formatError(error)}`);
             }
         }
     }
@@ -1385,19 +1462,17 @@ datasources:
         // Important: We allow also to store "unknown" states, so use fallback here
         const _settings = this._influxDPs[_id] || ({} as SavedInfluxDbCustomConfig);
 
+        // InfluxDB can not handle null or non-finite values. The error is thrown (and not just logged),
+        // because storeState() has to answer with it instead of a silent "success"; the state-change path
+        // catches it and logs it once per datapoint, see logSkipOnce().
         if (state.val === null) {
-            if (!this._warnedValueIDs.has(`null:${_id}`)) {
-                this._warnedValueIDs.add(`null:${_id}`);
-                this.log.info(`Skipping null value for ${_id} - InfluxDB cannot store null (this message appears only once per datapoint)`);
-            }
-            return;
+            throw new UnstorableValueError('null', `Skipping null value for ${_id}: InfluxDB can not store null`);
         }
         if (typeof state.val === 'number' && !isFinite(state.val)) {
-            if (!this._warnedValueIDs.has(`nan:${_id}`)) {
-                this._warnedValueIDs.add(`nan:${_id}`);
-                this.log.info(`Skipping non-finite value (${state.val}) for ${_id} - InfluxDB cannot store NaN/Infinity (this message appears only once per datapoint)`);
-            }
-            return;
+            throw new UnstorableValueError(
+                'nonFinite',
+                `Skipping non-finite value (${state.val}) for ${_id}: InfluxDB can not store NaN/Infinity`,
+            );
         }
 
         if (state.val !== null && (typeof state.val === 'object' || typeof state.val === 'undefined')) {
@@ -1422,11 +1497,10 @@ datasources:
             if (typeof state.val === 'boolean') {
                 state.val = state.val ? 1 : 0;
             } else {
-                if (!this._warnedValueIDs.has(`type:${_id}`)) {
-                    this._warnedValueIDs.add(`type:${_id}`);
-                    this.log.info(`Skipping value "${state.val}" for ${_id} - not a number but storageType is Number (this message appears only once per datapoint)`);
-                }
-                return;
+                throw new UnstorableValueError(
+                    'type',
+                    `Skipping value "${state.val}" for ${_id}: not a number, but storageType is "Number"`,
+                );
             }
         } else if (_settings.storageType === 'Boolean' && typeof state.val !== 'boolean') {
             state.val = !!state.val;
@@ -1582,8 +1656,8 @@ datasources:
             await this._client?.writeSeries(series);
             this.setConnected(true);
         } catch (error) {
-            this.log.warn(`Error on writeSeries: ${extractError(error)}`);
-            if (!this._client?.getHostsAvailable()) {
+            if (!this._client?.getHostsAvailable() || isConnectionError(error)) {
+                this.logConnectionError(error, 'Error on writeSeries');
                 this.setConnected(false);
                 this.log.info('Host not available, move all points back in the Buffer');
                 // error caused InfluxDB this._client to remove the host from available for now
@@ -1596,7 +1670,8 @@ datasources:
                 });
                 this.reconnect();
             } else {
-                const errorText = extractError(error);
+                const errorText = formatError(error);
+                this.log.warn(`Error on writeSeries: ${errorText}`);
                 if (errorText && errorText.includes('partial write') && !errorText.includes('field type conflict')) {
                     this.log.warn('All possible data points were written, others can not really be corrected');
                 } else {
@@ -1638,12 +1713,11 @@ datasources:
                 await this._client?.writePoints(seriesId, pointsToSend);
                 this.setConnected(true);
             } catch (error) {
-                this.log.warn(`Error on writePoints for ${seriesId}: ${extractError(error)}`);
-                if (
-                    !this._client?.getHostsAvailable() ||
-                    (error.message && (error.message === 'timeout' || error.message.includes('timed out')))
-                ) {
-                    this.log.info('Host not available, move all points back in the Buffer');
+                // A connection error hits every point alike - splitting the batch down to single points
+                // would only repeat the same error for each of them and flood the log.
+                if (!this._client?.getHostsAvailable() || isConnectionError(error)) {
+                    this.logConnectionError(error, `Error on writePoints for ${seriesId}`);
+                    this.log.debug('Host not available, move all points back in the Buffer');
                     // error caused InfluxDB this._client to remove the host from available for now
                     this._seriesBuffer[seriesId] ||= [];
 
@@ -1658,6 +1732,7 @@ datasources:
                     this.reconnect();
                     return;
                 }
+                this.log.warn(`Error on writePoints for ${seriesId}: ${formatError(error)}`);
                 this.log.warn(`Try to write ${pointsToSend.length} Points separate to find the conflicting one`);
                 // we found the conflicting id
                 await this.writePointsForID(seriesId, pointsToSend);
@@ -1693,12 +1768,13 @@ datasources:
                 this._errorPoints[pointId] = 0;
             }
         } catch (error) {
-            this.log.warn(`Error on writePoint("${JSON.stringify(point)}): ${extractError(error)}"`);
-            const errorText = extractError(error);
-            if (!this._client?.getHostsAvailable() || errorText.includes('timeout')) {
+            const errorText = formatError(error);
+            if (!this._client?.getHostsAvailable() || isConnectionError(error)) {
+                this.logConnectionError(error, `Error on writePoint for ${pointId}`);
                 this.reconnect();
                 await this.addPointToSeriesBuffer(pointId, point);
             } else if (errorText.includes('field type conflict')) {
+                this.log.warn(`Error on writePoint("${JSON.stringify(point)}): ${errorText}"`);
                 // retry write after type correction for some easy cases
                 let retry = false;
                 let adjustType = false;
@@ -1781,6 +1857,7 @@ datasources:
                     );
                 }
             } else {
+                this.log.warn(`Error on writePoint("${JSON.stringify(point)}): ${errorText}"`);
                 if (!this._errorPoints[pointId]) {
                     this._errorPoints[pointId] = 1;
                 } else {
@@ -1821,7 +1898,7 @@ datasources:
                     `Store data for ${fileData.seriesBufferCounter} points and ${Object.keys(fileData.conflictingPoints).length} conflicts`,
                 );
             } catch (error) {
-                this.log.warn(`Could not save non-stored data to file: ${extractError(error)}`);
+                this.log.warn(`Could not save non-stored data to file: ${formatError(error)}`);
             }
         }
         this._seriesBufferCounter = 0;
@@ -1856,7 +1933,7 @@ datasources:
                 await this._client?.query(query);
                 this.setConnected(true);
             } catch (error) {
-                this.log.warn(`Error on delete("${query}): ${extractError(error)}"`);
+                this.log.warn(`Error on delete("${query}): ${formatError(error)}"`);
                 throw error;
             }
         } else if (this.config.dbversion === '2.x') {
@@ -1895,7 +1972,7 @@ datasources:
                     this.setConnected(true);
                 }
             } catch (error) {
-                this.log.warn(`Error on delete("${extractError(error)}"`);
+                this.log.warn(`Error on delete("${formatError(error)}"`);
                 throw error;
             }
         } else {
@@ -2015,7 +2092,7 @@ datasources:
                     msg.command,
                     {
                         success: false,
-                        error: extractError(error),
+                        error: formatError(error),
                         connected: !!this._connected,
                     },
                     msg.callback,
@@ -2041,7 +2118,7 @@ datasources:
                     msg.command,
                     {
                         success: false,
-                        error: extractError(error),
+                        error: formatError(error),
                         connected: !!this._connected,
                     },
                     msg.callback,
@@ -2100,7 +2177,7 @@ datasources:
                     msg.command,
                     {
                         success: false,
-                        error: extractError(error),
+                        error: formatError(error),
                         connected: !!this._connected,
                     },
                     msg.callback,
@@ -2126,7 +2203,7 @@ datasources:
                     msg.command,
                     {
                         success: false,
-                        error: extractError(error),
+                        error: formatError(error),
                         connected: !!this._connected,
                     },
                     msg.callback,
@@ -2291,7 +2368,7 @@ datasources:
                     msg.command,
                     {
                         success: false,
-                        error: extractError(error),
+                        error: formatError(error),
                         connected: !!this._connected,
                     },
                     msg.callback,
@@ -2315,7 +2392,7 @@ datasources:
                     msg.command,
                     {
                         success: false,
-                        error: extractError(error),
+                        error: formatError(error),
                         connected: !!this._connected,
                     },
                     msg.callback,
@@ -2333,7 +2410,7 @@ datasources:
                     msg.command,
                     {
                         success: !error,
-                        error: extractError(error),
+                        error: formatError(error),
                         connected: !!this._connected,
                     },
                     msg.callback,
@@ -2374,7 +2451,7 @@ datasources:
                 await this.pushHelper(id, state);
             }
         } catch (error) {
-            throw new Error(`Error writing state for ${id}: ${extractError(error)}, Data: ${JSON.stringify(state)}`);
+            throw new Error(`Error writing state for ${id}: ${formatError(error)}, Data: ${JSON.stringify(state)}`);
         }
     }
 
@@ -2402,7 +2479,7 @@ datasources:
                     await this.storeStatePushData(id, msg.message[i].state, msg.message[i].rules);
                     successCount++;
                 } catch (error) {
-                    errors.push(extractError(error));
+                    errors.push(formatError(error));
                 }
             }
         } else if (msg.message.id && Array.isArray(msg.message.state)) {
@@ -2413,7 +2490,7 @@ datasources:
                     await this.storeStatePushData(id, msg.message.state[j], msg.message.rules);
                     successCount++;
                 } catch (error) {
-                    errors.push(extractError(error));
+                    errors.push(formatError(error));
                 }
             }
         } else if (msg.message.id && msg.message.state) {
@@ -2423,7 +2500,7 @@ datasources:
                 await this.storeStatePushData(id, msg.message.state, msg.message.rules);
                 successCount++;
             } catch (error) {
-                errors.push(extractError(error));
+                errors.push(formatError(error));
             }
         } else {
             this.log.error('storeState called with invalid data');
@@ -2515,7 +2592,7 @@ datasources:
                     this._influxDPs[id].skipped = null;
                 }
             } catch (error) {
-                this.log.warn(`Error by bush: ${error}`);
+                this.logPushError(id, error);
             }
         }
 
@@ -2914,14 +2991,14 @@ datasources:
                         if (this._client.getHostsAvailable() === 0) {
                             this.setConnected(false);
                         }
-                        this.log.error(`getHistory: ${extractError(error)}`);
-                        sendResponse(this, msg, id, options, extractError(error), startTime);
+                        this.log.error(`getHistory: ${formatError(error)}`);
+                        sendResponse(this, msg, id, options, formatError(error), startTime);
                     }
                 },
                 storedCount ? 50 : 0,
             );
         } catch (error) {
-            this.log.info(`Error storing buffered series for ${id} before GetHistory: ${extractError(error)}`);
+            this.log.info(`Error storing buffered series for ${id} before GetHistory: ${formatError(error)}`);
         }
     }
 
@@ -3129,9 +3206,9 @@ ${this.config.usetags ? ' |> duplicate(column: "_value", as: "value")' : ' |> pi
                             supportsAggregates = !!result?.find(r => r.error?.includes('type conflict: bool'));
                         }
                     } catch (error) {
-                        if (extractError(error).includes('type conflict: bool')) {
+                        if (formatError(error).includes('type conflict: bool')) {
                             if (debugLog) {
-                                this.log.debug(`${logId} Bool check error: ${extractError(error)}`);
+                                this.log.debug(`${logId} Bool check error: ${formatError(error)}`);
                             }
                             supportsAggregates = true;
                         } else {
@@ -3141,7 +3218,7 @@ ${this.config.usetags ? ' |> duplicate(column: "_value", as: "value")' : ' |> pi
                                 msg.command,
                                 {
                                     result: [],
-                                    error: extractError(error),
+                                    error: formatError(error),
                                     sessionId: options.sessionId,
                                 },
                                 msg.callback,
@@ -3347,13 +3424,13 @@ ${!this.config.usetags ? '|> pivot(rowKey:["_time"], columnKey: ["_field"], valu
                         if (!this._client?.getHostsAvailable()) {
                             this.setConnected(false);
                         }
-                        this.log.error(`getHistory: ${extractError(error)}`);
+                        this.log.error(`getHistory: ${formatError(error)}`);
                     }
                 },
                 storedCount ? 50 : 0,
             );
         } catch (error) {
-            this.log.info(`Error storing buffered series for ${id} before GetHistory: ${extractError(error)}`);
+            this.log.info(`Error storing buffered series for ${id} before GetHistory: ${formatError(error)}`);
         }
     }
 
@@ -3426,13 +3503,13 @@ ${!this.config.usetags ? '|> pivot(rowKey:["_time"], columnKey: ["_field"], valu
                 if (!this._client.getHostsAvailable()) {
                     this.setConnected(false);
                 }
-                this.log.error(`query: ${extractError(error)}`);
+                this.log.error(`query: ${formatError(error)}`);
                 this.sendTo(
                     msg.from,
                     msg.command,
                     {
                         result: [],
-                        error: extractError(error),
+                        error: formatError(error),
                     },
                     msg.callback,
                 );
@@ -3465,13 +3542,13 @@ ${!this.config.usetags ? '|> pivot(rowKey:["_time"], columnKey: ["_field"], valu
                     }
                 }
             } catch (error) {
-                this.log.warn(`Error in received multiQuery: ${extractError(error)}`);
+                this.log.warn(`Error in received multiQuery: ${formatError(error)}`);
                 this.sendTo(
                     msg.from,
                     msg.command,
                     {
                         result: [],
-                        error: extractError(error),
+                        error: formatError(error),
                     },
                     msg.callback,
                 );
@@ -3526,13 +3603,13 @@ ${!this.config.usetags ? '|> pivot(rowKey:["_time"], columnKey: ["_field"], valu
                     if (!this._client?.getHostsAvailable()) {
                         this.setConnected(false);
                     }
-                    this.log.error(`queries: ${extractError(error)}`);
+                    this.log.error(`queries: ${formatError(error)}`);
                     return this.sendTo(
                         msg.from,
                         msg.command,
                         {
                             result: [],
-                            error: extractError(error),
+                            error: formatError(error),
                         },
                         msg.callback,
                     );
@@ -3689,8 +3766,8 @@ ${!this.config.usetags ? '|> pivot(rowKey:["_time"], columnKey: ["_field"], valu
         try {
             measurements = await this.readMeasurements();
         } catch (error) {
-            this.log.error(`getDatapoints: ${extractError(error)}`);
-            return this.sendTo(msg.from, msg.command, { error: extractError(error) }, msg.callback);
+            this.log.error(`getDatapoints: ${formatError(error)}`);
+            return this.sendTo(msg.from, msg.command, { error: formatError(error) }, msg.callback);
         }
 
         const result: { id: string; type: StorageType | null }[] = [];
@@ -3820,8 +3897,8 @@ ${!this.config.usetags ? '|> pivot(rowKey:["_time"], columnKey: ["_field"], valu
             if (!this._client?.getHostsAvailable()) {
                 this.setConnected(false);
             }
-            this.log.error(`getRawEntries: ${extractError(error)}`);
-            this.sendTo(msg.from, msg.command, { error: extractError(error) }, msg.callback);
+            this.log.error(`getRawEntries: ${formatError(error)}`);
+            this.sendTo(msg.from, msg.command, { error: formatError(error) }, msg.callback);
         }
     }
 }
