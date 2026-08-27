@@ -66,10 +66,6 @@ export default class DatabaseInfluxDB2x extends Database {
         this.deleteApi = new DeleteAPI(this.connection);
     }
 
-    getHostsAvailable(): number {
-        return 1; // always one host with InfluxDB 2.x
-    }
-
     async deleteData(
         start: Date | number,
         stop: Date | number,
@@ -91,7 +87,7 @@ export default class DatabaseInfluxDB2x extends Database {
     async getDatabaseNames(): Promise<string[]> {
         this.log.debug(`Organization being checked: ${this.organization}`);
 
-        const organizations = await this.orgsApi.getOrgs({ org: this.organization });
+        const organizations = await this.trackConnection(() => this.orgsApi.getOrgs({ org: this.organization }));
         this.log.debug(`Organizations: ${JSON.stringify(organizations)}`);
         if (!organizations?.orgs?.length) {
             throw new Error(
@@ -103,7 +99,7 @@ export default class DatabaseInfluxDB2x extends Database {
             throw new Error(`Could not find organization ID for organization "${this.organization}"`);
         }
 
-        const buckets = await this.bucketsApi.getBuckets({ orgID: this.organizationId });
+        const buckets = await this.trackConnection(() => this.bucketsApi.getBuckets({ orgID: this.organizationId }));
         this.log.debug(`Buckets: ${JSON.stringify(buckets)}`);
 
         const foundDatabases: string[] = [];
@@ -186,7 +182,7 @@ export default class DatabaseInfluxDB2x extends Database {
         }
 
         this.writeApi.writePoints(points);
-        await this.writeApi.flush();
+        await this.trackConnection(() => this.writeApi.flush());
         this.log.debug(`Points written to ${this.database}`);
     }
 
@@ -199,14 +195,14 @@ export default class DatabaseInfluxDB2x extends Database {
         });
 
         this.writeApi.writePoints(points);
-        await this.writeApi.flush();
+        await this.trackConnection(() => this.writeApi.flush());
         this.log.debug(`Points written to ${this.database}`);
     }
 
     async writePoint(seriesId: string, value: ValuesForInflux): Promise<void> {
         this.log.debug(`Write Point: ${seriesId} values:${JSON.stringify(value)}`);
         this.writeApi.writePoint(this.stateValueToPoint(seriesId, value));
-        await this.writeApi.flush();
+        await this.trackConnection(() => this.writeApi.flush());
         this.log.debug(`Point written to ${this.database}`);
     }
 
@@ -245,33 +241,36 @@ export default class DatabaseInfluxDB2x extends Database {
     query<T>(query: string): Promise<Array<T & { time: Date }>> {
         this.log.debug(`Query to execute: ${query}`);
 
-        return new Promise((resolve, reject) => {
-            const rows: Array<T & { time: Date }> = [];
-            this.queryApi.queryRows(query, {
-                next(row, tableMeta) {
-                    const fields = tableMeta.toObject(row);
+        return this.trackConnection(
+            () =>
+                new Promise<Array<T & { time: Date }>>((resolve, reject) => {
+                    const rows: Array<T & { time: Date }> = [];
+                    this.queryApi.queryRows(query, {
+                        next(row, tableMeta) {
+                            const fields = tableMeta.toObject(row);
 
-                    // Columns "_time" and "_value" are mapped to "time" and "value" for backwards compatibility
-                    if ((fields as any)._time !== null) {
-                        fields.time = (fields as any)._time;
-                    }
+                            // Columns "_time" and "_value" are mapped to "time" and "value" for backwards compatibility
+                            if ((fields as any)._time !== null) {
+                                fields.time = (fields as any)._time;
+                            }
 
-                    rows.push(fields as T & { time: Date });
-                },
-                error(error) {
-                    // Ignore errors that are related to an empty range. The handling of this currently seems inconsistent for flux.
-                    // See also https://github.com/influxdata/flux/issues/3543
-                    if (error.message.match('.*cannot query an empty range.*')) {
-                        resolve(rows);
-                    } else {
-                        reject(error);
-                    }
-                },
-                complete() {
-                    resolve(rows);
-                },
-            });
-        });
+                            rows.push(fields as T & { time: Date });
+                        },
+                        error(error) {
+                            // Ignore errors that are related to an empty range. The handling of this currently seems inconsistent for flux.
+                            // See also https://github.com/influxdata/flux/issues/3543
+                            if (error.message.match('.*cannot query an empty range.*')) {
+                                resolve(rows);
+                            } else {
+                                reject(error);
+                            }
+                        },
+                        complete() {
+                            resolve(rows);
+                        },
+                    });
+                }),
+        );
     }
 
     async getMetaDataStorageType(): Promise<'tags' | 'fields' | 'none'> {
@@ -304,7 +303,13 @@ export default class DatabaseInfluxDB2x extends Database {
 
     async ping(): Promise<{ online: boolean }[]> {
         // can't do much with interval, so ignoring it for compatibility reasons
-        const result = await this.healthApi.getHealth();
-        return result.status === 'pass' ? [{ online: true }] : [{ online: false }];
+        const result = await this.trackConnection(() => this.healthApi.getHealth());
+        if (result.status === 'pass') {
+            this.markHostAvailable();
+            return [{ online: true }];
+        }
+        // reachable, but not healthy - treat it like a dead host, the adapter reconnects
+        this.markHostUnavailable();
+        return [{ online: false }];
     }
 }

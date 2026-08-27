@@ -1,3 +1,14 @@
+import { formatError, isConnectionError } from './errors';
+
+/**
+ * How long a host counts as unusable after a connection error.
+ *
+ * The 1.x driver pool takes a host out of rotation the same way, and without an expiry the adapter
+ * would keep buffering forever, because only a successful request could ever bring the host back -
+ * and no request is sent while the host counts as unavailable. Roughly the reconnect interval.
+ */
+const HOST_UNAVAILABLE_TIME = 10_000;
+
 export type ValuesForInflux = {
     value: string | number | boolean;
     time: number;
@@ -29,6 +40,8 @@ export abstract class Database {
     protected readonly protocol: 'http' | 'https';
     protected readonly database: string;
     protected readonly requestTimeout: number;
+    /** 0 if the host is usable, otherwise the time of the connection error that took it out of rotation */
+    private hostUnavailableSince = 0;
 
     protected constructor(options: {
         log: ioBroker.Logger;
@@ -45,6 +58,57 @@ export abstract class Database {
         this.database = options.database;
         this.requestTimeout = options.requestTimeout;
     }
+    /**
+     * Is the InfluxDB host currently usable?
+     *
+     * The adapter uses this to decide whether it may write at all or has to buffer: writing point by
+     * point against a server that is not reachable produces one error (and one log line) per point.
+     * A host that failed with a connection error is taken out of rotation for a short while and is
+     * then tried again - exactly what the connection pool of the 1.x driver does internally.
+     *
+     * @returns 1 while the host may be used, 0 while it is known to be unreachable
+     */
+    getHostsAvailable(): number {
+        if (this.hostUnavailableSince && Date.now() - this.hostUnavailableSince < HOST_UNAVAILABLE_TIME) {
+            return 0;
+        }
+        // the backoff is over: give the host another try
+        this.hostUnavailableSince = 0;
+        return 1;
+    }
+
+    /** Report that the host answered, so it counts as usable again */
+    protected markHostAvailable(): void {
+        this.hostUnavailableSince = 0;
+    }
+
+    /** Report that the host is not reachable, so the adapter buffers instead of writing point by point */
+    protected markHostUnavailable(): void {
+        this.hostUnavailableSince = Date.now();
+    }
+
+    /**
+     * Run a request and remember whether the host answered.
+     *
+     * Only connection errors change the state: a rejected point ("field type conflict", "unauthorized")
+     * says nothing about the reachability of the server and must not stop the adapter from writing.
+     *
+     * @param action the request to execute
+     * @returns whatever the request returned
+     */
+    protected async trackConnection<T>(action: () => Promise<T>): Promise<T> {
+        try {
+            const result = await action();
+            this.markHostAvailable();
+            return result;
+        } catch (error) {
+            if (isConnectionError(error)) {
+                this.markHostUnavailable();
+            }
+            throw error;
+        }
+    }
+
     abstract connect(): void;
     abstract getDatabaseNames(): Promise<string[]>;
     abstract createDatabase(dbname: string): Promise<void>;
@@ -60,7 +124,6 @@ export abstract class Database {
     abstract writePoints(seriesId: string, pointsToSend: ValuesForInflux[]): Promise<void>;
     // write one point to one series
     abstract writePoint(seriesId: string, value: ValuesForInflux): Promise<void>;
-    abstract getHostsAvailable(): number;
     abstract deleteData(
         start: Date | number,
         stop: Date | number,
@@ -81,7 +144,7 @@ export abstract class Database {
                 success = true;
                 collectedRows.push(rows as Array<T & { time: Date }>);
             } catch (error) {
-                this.log.warn(`Error in query "${query}": ${error}`);
+                this.log.warn(`Error in query "${query}": ${formatError(error)}`);
                 errors.push(error);
                 collectedRows.push([] as any);
             }

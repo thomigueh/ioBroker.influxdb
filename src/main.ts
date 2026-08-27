@@ -6,7 +6,7 @@ import { sendResponse, sortByTs } from '@iobroker/aggregate';
 import DatabaseInfluxDB1x from './lib/DatabaseInfluxDB1x';
 import DatabaseInfluxDB2x from './lib/DatabaseInfluxDB2x';
 import { escapeFluxString, escapeInfluxQLIdentifier, type Database, type ValuesForInflux } from './lib/Database';
-import { formatError, isConnectionError, UnstorableValueError } from './lib/errors';
+import { formatError, HostUnavailableError, isConnectionError, UnstorableValueError } from './lib/errors';
 import type {
     GetHistoryOptions,
     InfluxDBAdapterConfig,
@@ -193,10 +193,11 @@ export class InfluxDBAdapter extends Adapter {
     private readonly _aliasMap: { [ioBrokerId: string]: string } = {};
     // IDs (plus the reason) that were already reported as "value can not be stored", see logSkipOnce()
     private readonly _warnedValueIDs: Set<string> = new Set();
-    // Last connection error, so a database that is switched off does not repeat the same line forever
-    private _lastConnectionError = '';
-    private _lastConnectionErrorTs = 0;
-    private _connectionErrorCount = 0;
+    // Connection errors already reported, so a database that is switched off does not repeat the same
+    // line forever. Keyed by the message: writes, reconnects and pings fail with different texts, and
+    // one shared slot would let them cancel each other's throttling out.
+    private readonly _connectionErrors: Map<string, { lastLogged: number; lastSeen: number; count: number }> =
+        new Map();
     // Per-instance cache file (must NOT be a module global, otherwise instances collide in compact mode)
     private _cacheFile = join(dataDir, 'influxdata.json');
 
@@ -345,21 +346,28 @@ export class InfluxDBAdapter extends Adapter {
     logConnectionError(error: unknown, prefix?: string): void {
         const text = `${prefix ? `${prefix}: ` : ''}${formatError(error)}`;
         const now = Date.now();
+        const known = this._connectionErrors.get(text);
 
-        if (text === this._lastConnectionError) {
-            this._connectionErrorCount++;
-            if (now - this._lastConnectionErrorTs >= REPEATED_ERROR_INTERVAL) {
-                this._lastConnectionErrorTs = now;
-                this.log.error(`${text} (still failing, ${this._connectionErrorCount} attempts)`);
+        if (known) {
+            known.count++;
+            known.lastSeen = now;
+            if (now - known.lastLogged >= REPEATED_ERROR_INTERVAL) {
+                known.lastLogged = now;
+                this.log.error(`${text} (still failing, ${known.count} attempts)`);
             } else {
-                this.log.debug(`${text} (attempt ${this._connectionErrorCount})`);
+                this.log.debug(`${text} (attempt ${known.count})`);
             }
-        } else {
-            this._lastConnectionError = text;
-            this._lastConnectionErrorTs = now;
-            this._connectionErrorCount = 1;
-            this.log.error(text);
+            return;
         }
+
+        // an error that stopped occurring is reported in full again when it comes back
+        for (const [key, value] of this._connectionErrors) {
+            if (now - value.lastSeen >= REPEATED_ERROR_INTERVAL) {
+                this._connectionErrors.delete(key);
+            }
+        }
+        this._connectionErrors.set(text, { lastLogged: now, lastSeen: now, count: 1 });
+        this.log.error(text);
     }
 
     /**
@@ -396,6 +404,20 @@ export class InfluxDBAdapter extends Adapter {
             this.logConnectionError(error, `Cannot write value of ${id}`);
         } else {
             this.log.warn(`Cannot write value of ${id}: ${formatError(error)}`);
+        }
+    }
+
+    /**
+     * Log why the buffered points could not be written: an unreachable database is throttled, anything
+     * else is a real error.
+     *
+     * @param error the caught error
+     */
+    logBufferError(error: unknown): void {
+        if (isConnectionError(error)) {
+            this.logConnectionError(error, 'Cannot store buffered series');
+        } else {
+            this.log.error(`Cannot store buffered series: ${formatError(error)}`);
         }
     }
 
@@ -1116,9 +1138,7 @@ export class InfluxDBAdapter extends Adapter {
             // store all buffered data every x seconds to not lost the data
             this._seriesBufferChecker = setInterval(() => {
                 this._seriesBufferFlushPlanned = true;
-                void this.storeBufferedSeries().catch(e =>
-                    this.log.error(`Cannot store buffered series: ${formatError(e)}`),
-                );
+                void this.storeBufferedSeries().catch(e => this.logBufferError(e));
             }, this.config.seriesBufferFlushInterval * 1000);
         }
     }
@@ -1600,14 +1620,14 @@ datasources:
 
         if (!this._client?.getHostsAvailable()) {
             this.setConnected(false);
-            this.log.info('Currently no hosts available, try later');
             this._seriesBufferFlushPlanned = false;
-            throw new Error('Currently no hosts available, try later');
+            // Points stay in the buffer and the next flush tries again - that is normal operation while
+            // the database is down and must not be logged on every buffered value.
+            throw new HostUnavailableError('Currently no host available, try later');
         }
         if (!this._connected) {
-            this.log.info('Not connected to InfluxDB, try later');
             this._seriesBufferFlushPlanned = false;
-            throw new Error('Not connected to InfluxDB, try later');
+            throw new HostUnavailableError('Not connected to InfluxDB, try later');
         }
 
         if (id) {
@@ -1645,7 +1665,8 @@ datasources:
         }
         this._seriesBufferFlushPlanned = false;
         this._seriesBufferChecker = setInterval(
-            () => this.storeBufferedSeries(),
+            // the rejection must be caught here: an unhandled one terminates the process
+            () => void this.storeBufferedSeries().catch(e => this.logBufferError(e)),
             (this.config.seriesBufferFlushInterval as number) * 1000,
         );
         return result;

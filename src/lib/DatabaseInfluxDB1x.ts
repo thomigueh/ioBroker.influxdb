@@ -61,15 +61,17 @@ export default class DatabaseInfluxDB1x extends Database {
         return Promise.resolve('fields');
     }
 
-    getHostsAvailable(): number {
-        return 1;
-    }
-
     async ping(): Promise<{ online: boolean }[]> {
         if (!this.connection) {
             return Promise.reject(new Error('No connection to InfluxDB'));
         }
         const hosts = await this.connection.ping(500);
+        // ping() does not throw for a dead host, it reports it as offline
+        if (hosts.some(host => host.online)) {
+            this.markHostAvailable();
+        } else {
+            this.markHostUnavailable();
+        }
         return hosts.map(host => ({ online: host.online }));
     }
 
@@ -77,7 +79,7 @@ export default class DatabaseInfluxDB1x extends Database {
         if (!this.connection) {
             return Promise.reject(new Error('No connection to InfluxDB'));
         }
-        return this.connection.getDatabaseNames();
+        return this.trackConnection(() => this.connection!.getDatabaseNames());
     }
 
     async getRetentionPolicyForDB(dbname: string): Promise<{ name: string | null; time: number | undefined } | null> {
@@ -190,7 +192,7 @@ export default class DatabaseInfluxDB1x extends Database {
                 }
             }
         }
-        await this.connection.writePoints(points);
+        await this.trackConnection(() => this.connection!.writePoints(points));
     }
 
     async writePoints(seriesId: string, pointsToSend: ValuesForInflux[]): Promise<void> {
@@ -218,7 +220,7 @@ export default class DatabaseInfluxDB1x extends Database {
             });
         }
 
-        await this.connection.writePoints(points);
+        await this.trackConnection(() => this.connection!.writePoints(points));
     }
 
     async writePoint(seriesId: string, pointToSend: ValuesForInflux): Promise<void> {
@@ -237,15 +239,17 @@ export default class DatabaseInfluxDB1x extends Database {
             }
             fields[key] = pointToSend[key as keyof ValuesForInflux];
         });
-        await this.connection.writePoints(
-            [
-                {
-                    measurement: escape.measurement(seriesId),
-                    fields,
-                    timestamp: new Date(pointToSend.time),
-                },
-            ],
-            { precision: 'ms' },
+        await this.trackConnection(() =>
+            this.connection!.writePoints(
+                [
+                    {
+                        measurement: escape.measurement(seriesId),
+                        fields,
+                        timestamp: new Date(pointToSend.time),
+                    },
+                ],
+                { precision: 'ms' },
+            ),
         );
     }
 
@@ -254,6 +258,6 @@ export default class DatabaseInfluxDB1x extends Database {
             return Promise.reject(new Error('No connection to InfluxDB'));
         }
         this.log.debug(`Query to execute: ${query}`);
-        return await this.connection.query<T>(query);
+        return await this.trackConnection(() => this.connection!.query<T>(query));
     }
 }

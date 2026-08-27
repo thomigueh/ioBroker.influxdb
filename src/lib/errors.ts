@@ -31,8 +31,8 @@ const CONNECTION_ERROR_CODES = [
     'ERR_SOCKET_CONNECTION_TIMEOUT',
 ];
 
-/** Error classes of the drivers that only ever mean "no usable host" */
-const CONNECTION_ERROR_NAMES = ['ServiceNotAvailableError'];
+/** Error classes that only ever mean "no usable host" - the driver's own and ours */
+const CONNECTION_ERROR_NAMES = ['ServiceNotAvailableError', 'HostUnavailableError'];
 
 /** HTTP status codes of a gateway/proxy in front of InfluxDB that mean the server itself is down */
 const CONNECTION_ERROR_STATUS_CODES = [502, 503, 504];
@@ -57,6 +57,19 @@ export class UnstorableValueError extends Error {
         super(message);
         this.name = 'UnstorableValueError';
         this.kind = kind;
+    }
+}
+
+/**
+ * The request was not even attempted, because the host is known to be unreachable.
+ *
+ * Thrown instead of a plain `Error`, so the caller can throttle it like any other connection error
+ * (`isConnectionError()` knows this class) rather than repeating it on every buffered value.
+ */
+export class HostUnavailableError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'HostUnavailableError';
     }
 }
 
