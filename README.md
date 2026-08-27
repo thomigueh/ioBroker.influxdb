@@ -457,7 +457,7 @@ sendTo('influxdb.0', 'getEnabledDPs', {}, function (result) {
 -->
 
 ## Changelog
-### **WORK IN PROGRESS**
+### 5.0.3 (2026-08-27)
 * (@GermanBluefox) Errors are logged with more detail: error code, `cause` and a driver-specific error name (`HttpError`, `ServiceNotAvailableError`) are shown now, and a nested error without a message no longer degrades to `{}` (same implementation as in the SQL adapter)
 * (@GermanBluefox) A switched-off or unreachable InfluxDB no longer floods the log (and syslog): a connection error is now recognized by its error code - Node reports a failed TCP connect as an `AggregateError` with an empty message, which no check could match before - so the points are buffered and a reconnect is scheduled instead of retrying every single point. The repeated error is logged once and afterwards only once an hour
 * (@GermanBluefox) `getHostsAvailable()` reports the real state again: it returned a hardcoded `1` since the TypeScript port, so every "host not available" check in the adapter was dead code. After a connection error the host is now taken out of rotation for a short backoff and values are buffered instead of being written - and logged - point by point
@@ -496,9 +496,6 @@ sendTo('influxdb.0', 'getEnabledDPs', {}, function (result) {
 * (Marc-Berg) The deletion of data from DB was implemented for V2
 * (bluefox) Added support for `count` aggregate type on getHistory
 * (bluefox) minimal supported node.js version is 16 now
-
-### 3.2.0 (2022-09-19)
-* (Apollon77) Adjust cache file to be different per instance when having multiple instances
 
 [Older changelogs can be found there](CHANGELOG_OLD.md)
 
