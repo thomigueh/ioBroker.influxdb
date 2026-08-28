@@ -1,4 +1,12 @@
 # Older changes
+## 4.0.2 (2024-01-03)
+* (bluefox) Corrected JSON config
+* (Marc-Berg) Corrected filter function in booleanTypeCheckQuery
+* (Marc-Berg) Allowed the self-signed certificates using "test connection" button
+* (Marc-Berg) The deletion of data from DB was implemented for V2
+* (bluefox) Added support for `count` aggregate type on getHistory
+* (bluefox) minimal supported node.js version is 16 now
+
 ## 3.2.0 (2022-09-19)
 * (Apollon77) Adjust cache file to be different per instance when having multiple instances
 

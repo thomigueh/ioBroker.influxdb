@@ -457,7 +457,7 @@ sendTo('influxdb.0', 'getEnabledDPs', {}, function (result) {
 -->
 
 ## Changelog
-### **WORK IN PROGRESS**
+### 5.0.4 (2026-08-28)
 * (@GermanBluefox) Fixed Grafana not finding the InfluxDB running next to it in Docker: the provisioned data source pointed at `iob_influxdb_<instance>`, while the container was named `iob_influxdb_<instance>_flux_data` because the compose file gave it a name of its own. Inside the shared network only the container name resolves, so the data source could not connect. The influx service uses the default name of the instance now - the name the data source and `testConnection()` both expect
 * (@GermanBluefox) Fixed the port of that data source: it used the port published on the host, although Grafana reaches InfluxDB inside the docker network, where the container port 8086 applies. The data source broke as soon as the port was changed in the settings
 * (@GermanBluefox) Fixed the Grafana container never being started when Grafana is enabled and InfluxDB is not: the plugin waits for the readiness signal of the adapter before it starts any container of the instance, and that signal was only sent when both were switched on. That state is reachable by switching InfluxDB off afterwards - the Grafana checkbox is hidden then, but its stored value stays
@@ -495,14 +495,6 @@ sendTo('influxdb.0', 'getEnabledDPs', {}, function (result) {
 
 ### 4.0.3 (2024-05-16)
 * (bluefox) Some packages were updated
-
-### 4.0.2 (2024-01-03)
-* (bluefox) Corrected JSON config
-* (Marc-Berg) Corrected filter function in booleanTypeCheckQuery
-* (Marc-Berg) Allowed the self-signed certificates using "test connection" button
-* (Marc-Berg) The deletion of data from DB was implemented for V2
-* (bluefox) Added support for `count` aggregate type on getHistory
-* (bluefox) minimal supported node.js version is 16 now
 
 [Older changelogs can be found there](CHANGELOG_OLD.md)
 
