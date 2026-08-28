@@ -8,7 +8,13 @@ services:
             - 'iobStopOnUnload=${config.dockerInflux.stopIfInstanceStopped:-false}'
             - 'iobAutoImageUpdate=${config.dockerInflux.autoImageUpdate:-true}'
             - 'iobBackup=flux_data,flux_config'
-        container_name: flux_data
+        # `true` selects the default name of the instance: iob_<adapterName>_<instance>.
+        # That name is what the container is reachable under inside the shared network, and both
+        # the grafana datasource (prepareDockerConfigGrafana) and the container that
+        # testConnection() starts on its own rely on exactly this name. Do not give it a name of
+        # its own - it would be prefixed to iob_<adapterName>_<instance>_<name> and neither of the
+        # two would find it any more.
+        container_name: true
         ports:
             - '${config.dockerInflux.bind:-127.0.0.1}:${config_dockerInflux_port:-8086}:8086'
         environment:
@@ -30,6 +36,7 @@ services:
         labels:
             - 'iobEnabled=${config.dockerGrafana.enabled:-true}'
             - 'iobStopOnUnload=${config.dockerGrafana.stopIfInstanceStopped:-true}'
+            - 'iobAutoImageUpdate=${config.dockerGrafana.autoImageUpdate:-true}'
             # `(force)` means that the content of the source is copied to the target by every start of the adapter
             - 'iobCopyVolumes=./build/grafana-provisioning->grafana_provisioning(force)'
             - 'iobWaitForReady=true'

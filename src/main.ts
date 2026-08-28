@@ -1126,10 +1126,20 @@ export class InfluxDBAdapter extends Adapter {
             this.config.organization = 'iobroker';
         }
 
-        if (this.config.dockerInflux?.enabled && this.config.dockerGrafana?.enabled) {
-            this.prepareDockerConfigGrafana(this.config);
+        if (this.config.dockerGrafana?.enabled) {
+            this.prepareDockerConfigGrafana();
+        }
+
+        // The grafana service is labeled with `iobWaitForReady`, so the plugin starts *no*
+        // container of this instance before this call - not even influx. It therefore has to
+        // happen whenever any of the two is switched on, not only when both are. Enabling grafana
+        // alone is a reachable state: the admin dialog hides its checkbox once influx is switched
+        // off, but the stored value stays, and its container would then never be started at all.
+        if (this.config.dockerInflux?.enabled || this.config.dockerGrafana?.enabled) {
             // Inform docker plugin about grafana provisioning folder is ready
-            this.getPluginInstance('docker')?.instanceIsReady();
+            void this.getPluginInstance('docker')
+                ?.instanceIsReady()
+                .catch((e: unknown) => this.log.error(`Cannot start the docker containers: ${formatError(e)}`));
         }
 
         void this.connect();
@@ -1143,12 +1153,18 @@ export class InfluxDBAdapter extends Adapter {
         }
     }
 
-    prepareDockerConfigGrafana(config: InfluxDBAdapterConfig): void {
+    prepareDockerConfigGrafana(): void {
         // ensure that the folders exist
         const provisioningFolder = join(__dirname, 'grafana-provisioning', 'datasources');
         if (!existsSync(provisioningFolder)) {
             mkdirSync(provisioningFolder, { recursive: true });
         }
+        // Grafana reaches InfluxDB over the shared docker network, not over the host:
+        // - the host is the name of the influx container, which is the default name of the
+        //   instance because the compose file declares `container_name: true` for that service
+        // - the port is the one *inside* the container and therefore always 8086. The configured
+        //   `dockerInflux.port` is only published on the host and would be the wrong one here as
+        //   soon as the user changes it
         writeFileSync(
             join(__dirname, 'grafana-provisioning', 'datasources', 'datasource.yml'),
             `apiVersion: 1
@@ -1157,7 +1173,7 @@ datasources:
   - name: InfluxDB
     type: influxdb
     access: proxy
-    url: http://iob_${this.namespace.replace(/[-.]/g, '_')}:${config.dockerInflux?.port || 8086}
+    url: http://iob_${this.namespace.replace(/[-.]/g, '_')}:8086
     jsonData:
       version: Flux
       organization: iobroker
