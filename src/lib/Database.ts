@@ -146,7 +146,7 @@ export abstract class Database {
             } catch (error) {
                 this.log.warn(`Error in query "${query}": ${formatError(error)}`);
                 errors.push(error);
-                collectedRows.push([] as any);
+                collectedRows.push([]);
             }
         }
 
