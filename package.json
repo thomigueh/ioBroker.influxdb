@@ -63,6 +63,7 @@
   ],
   "scripts": {
     "prepublishOnly": "npm run build",
+    "prepare": "tsc -p tsconfig.build.json",
     "test": "mocha --exit",
     "lint": "eslint -c eslint.config.mjs && cd src-admin && npm run lint",
     "release": "release-script",

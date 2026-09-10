@@ -77,14 +77,14 @@
                     "newLine": true,
                     "type": "text",
                     "label": "User",
-                    "hidden": "data.dbversion === '2.x' || !!data.dockerInflux?.enabled",
+                    "hidden": "data.dbversion === '2.x' || data.dbversion === '3.x' || !!data.dockerInflux?.enabled",
                     "sm": 12,
                     "md": 4
                 },
                 "password": {
                     "type": "password",
                     "label": "Password",
-                    "hidden": "data.dbversion === '2.x' || !!data.dockerInflux?.enabled",
+                    "hidden": "data.dbversion === '2.x' || data.dbversion === '3.x' || !!data.dockerInflux?.enabled",
                     "repeat": true,
                     "sm": 12,
                     "md": 8
