@@ -5,7 +5,9 @@ import { sendResponse, sortByTs } from '@iobroker/aggregate';
 
 import DatabaseInfluxDB1x from './lib/DatabaseInfluxDB1x';
 import DatabaseInfluxDB2x from './lib/DatabaseInfluxDB2x';
+import DatabaseInfluxDB3 from './lib/DatabaseInfluxDB3';
 import { escapeFluxString, escapeInfluxQLIdentifier, type Database, type ValuesForInflux } from './lib/Database';
+import { escapeSqlIdentifier } from './lib/lineProtocol';
 import { formatError, HostUnavailableError, isConnectionError, UnstorableValueError } from './lib/errors';
 import type {
     GetHistoryOptions,
@@ -477,6 +479,28 @@ export class InfluxDBAdapter extends Adapter {
         this.log.info(`Influx DB Version used: ${this.config.dbversion}`);
 
         switch (this.config.dbversion) {
+            case '3.x': {
+                // eslint-disable-next-line no-control-regex
+                if (/[\x00-\x08\x0E-\x1F\x80-\xFF]/.test(this.config.token)) {
+                    this.log.error('Token error: Please re-enter the token in Admin. Stopping');
+                    return;
+                }
+                this._client = new DatabaseInfluxDB3(
+                    {
+                        log: this.log,
+                        host: this.config.host,
+                        port: this.config.port,
+                        protocol: this.config.protocol, // optional, default 'http'
+                        database: this.config.dbname,
+                        requestTimeout: this.config.requestTimeout as number,
+                    },
+                    {
+                        token: this.config.token,
+                        validateSSL: this.config.validateSSL,
+                    },
+                );
+                break;
+            }
             case '2.x':
                 // eslint-disable-next-line no-control-regex
                 if (/[\x00-\x08\x0E-\x1F\x80-\xFF]/.test(this.config.token)) {
@@ -563,7 +587,8 @@ export class InfluxDBAdapter extends Adapter {
                 // tags/fields compatibility check), so it can abort the start on a conflict.
                 await this.checkMetaDataStorageType();
             } else {
-                // For 1.x there is no metadata storage type check, so finalize the connection here.
+                // For 1.x and 3.x there is no metadata storage type check, so finalize the
+                // connection here.
                 // (Previously startPing/processStartValues/"Connected!" only ran for 2.x.)
                 this.setConnected(true);
                 await this.processStartValues();
@@ -736,6 +761,23 @@ export class InfluxDBAdapter extends Adapter {
             config.dbname ||= 'iobroker';
 
             switch (config.dbversion) {
+                case '3.x':
+                    this.log.info('Connecting to InfluxDB 3');
+                    lClient = new DatabaseInfluxDB3(
+                        {
+                            log: this.log,
+                            host: config.host,
+                            port: config.port,
+                            protocol: config.protocol, // optional, default 'http'
+                            database: config.dbname,
+                            requestTimeout: config.requestTimeout,
+                        },
+                        {
+                            token: config.token,
+                            validateSSL: config.validateSSL,
+                        },
+                    );
+                    break;
                 case '2.x':
                     this.log.info('Connecting to InfluxDB 2');
                     lClient = new DatabaseInfluxDB2x(
@@ -896,6 +938,8 @@ export class InfluxDBAdapter extends Adapter {
             } else if (msg.command === 'getHistory') {
                 if (this.config.dbversion === '1.x') {
                     await this.getHistoryV1(msg);
+                } else if (this.config.dbversion === '3.x') {
+                    await this.getHistoryV3(msg);
                 } else {
                     await this.getHistoryV2(msg);
                 }
@@ -908,6 +952,10 @@ export class InfluxDBAdapter extends Adapter {
                     case '2.x':
                         // Influx 2.x uses Flux instead of InfluxQL,
                         // so for multiple statements there is no delimiter by default, so we introduce ;
+                        await this.multiQuery(msg);
+                        break;
+                    case '3.x':
+                        // InfluxDB 3 uses SQL; multiple statements are separated by ;
                         await this.multiQuery(msg);
                         break;
                     case '1.x':
@@ -1973,6 +2021,28 @@ datasources:
                 this.log.warn(`Error on delete("${query}): ${formatError(error)}"`);
                 throw error;
             }
+        } else if (this.config.dbversion === '3.x') {
+            const safeId = escapeSqlIdentifier(id);
+            let query;
+            if (state.ts) {
+                query = `DELETE FROM "${safeId}" WHERE time = '${new Date(state.ts).toISOString()}'`;
+            } else if (state.start) {
+                query = `DELETE FROM "${safeId}" WHERE time >= '${new Date(state.start).toISOString()}'${
+                    state.end ? ` AND time <= '${new Date(state.end).toISOString()}'` : ''
+                }`;
+            } else if (state.end) {
+                query = `DELETE FROM "${safeId}" WHERE time <= '${new Date(state.end).toISOString()}'`;
+            } else {
+                query = `DELETE FROM "${safeId}" WHERE time >= '2000-01-01T00:00:00.000Z'`; // delete all
+            }
+
+            try {
+                await this._client?.query(query);
+                this.setConnected(true);
+            } catch (error) {
+                this.log.warn(`Error on delete("${query}): ${formatError(error)}"`);
+                throw error;
+            }
         } else if (this.config.dbversion === '2.x') {
             let start;
             let stop;
@@ -2301,6 +2371,55 @@ datasources:
                     storedState.ts = state.ts;
 
                     await this._delete(id, { ts: new Date(stored.time || stored.ts).getTime() });
+                    await this.pushValueIntoDB(id, storedState, true);
+                } else {
+                    this.log.error(`Cannot find value to delete for ${id}: ${JSON.stringify(state)}`);
+                    throw new Error('not found');
+                }
+            } catch (error) {
+                this.log.warn(`Error on update("${query}): ${error} / ${JSON.stringify(error.message)}"`);
+                throw error;
+            }
+        } else if (this.config.dbversion === '3.x') {
+            const query = `SELECT * FROM "${escapeSqlIdentifier(id)}" WHERE time = '${new Date(state.ts).toISOString()}'`;
+
+            try {
+                const result = await this._client?.query<{
+                    value?: ioBroker.StateValue;
+                    val: ioBroker.StateValue;
+                    ack: boolean;
+                    q: number;
+                    from: string;
+                }>(query);
+                if (this._client) {
+                    this.setConnected(true);
+                }
+
+                if (result?.length) {
+                    const stored = result[0];
+                    const storedState: ioBroker.State = {
+                        val: stored.val === undefined ? stored.value : stored.val,
+                        ack: stored.ack,
+                        q: stored.q,
+                        ts: state.ts,
+                        from: stored.from,
+                    } as ioBroker.State;
+
+                    if (state.val !== undefined) {
+                        storedState.val = state.val;
+                    }
+                    if (state.ack !== undefined) {
+                        storedState.ack = state.ack;
+                    }
+                    if (state.q !== undefined) {
+                        storedState.q = state.q;
+                    }
+                    if (state.from) {
+                        storedState.from = state.from;
+                    }
+                    storedState.ts = state.ts;
+
+                    await this._delete(id, { ts: state.ts });
                     await this.pushValueIntoDB(id, storedState, true);
                 } else {
                     this.log.error(`Cannot find value to delete for ${id}: ${JSON.stringify(state)}`);
@@ -3039,6 +3158,337 @@ datasources:
         }
     }
 
+    /**
+     * getHistory for InfluxDB 3 - same options normalization as V1/V2, but the query is SQL.
+     *
+     * Aggregation is pushed into the DB with DATE_BIN where possible; for unsupported aggregates
+     * (none, onchange, minmax, linear integral, non-numeric values) the raw rows are returned and
+     * `percentile`/`quantile`/linear-`integral` and non-numeric values are aggregated client-side
+     * by the shared aggregation helper (`sendResponse`) with `options.preAggregated = false`.
+     */
+    async getHistoryV3(msg: ioBroker.Message): Promise<void> {
+        const startTime = Date.now();
+
+        if (!msg.message?.options) {
+            return this.sendTo(
+                msg.from,
+                msg.command,
+                {
+                    error: 'Invalid call. No options for getHistory provided',
+                },
+                msg.callback,
+            );
+        }
+
+        const logId = (msg.message.id ? msg.message.id : 'all') + Date.now() + Math.random();
+        const id: string | undefined = msg.message.id === '*' ? undefined : msg.message.id;
+
+        const options: GetHistoryOptions = {
+            start: msg.message.options.start,
+            end: msg.message.options.end || new Date().getTime() + 5000000,
+            step: parseInt(msg.message.options.step, 10) || undefined,
+            count: parseInt(msg.message.options.count, 10),
+            aggregate: msg.message.options.aggregate || 'average',
+            limit:
+                parseInt(msg.message.options.limit, 10) ||
+                parseInt(msg.message.options.count, 10) ||
+                parseInt(this.config.limit as string, 10) ||
+                2000,
+            addId: msg.message.options.addId || false,
+            ignoreNull: true,
+            sessionId: msg.message.options.sessionId,
+            returnNewestEntries: msg.message.options.returnNewestEntries || false,
+            percentile:
+                msg.message.options.aggregate === 'percentile'
+                    ? parseInt(msg.message.options.percentile, 10) || 50
+                    : undefined,
+            quantile:
+                msg.message.options.aggregate === 'quantile'
+                    ? parseFloat(msg.message.options.quantile) || 0.5
+                    : undefined,
+            integralUnit:
+                msg.message.options.aggregate === 'integral'
+                    ? parseInt(msg.message.options.integralUnit, 10) || 60
+                    : undefined,
+            integralInterpolation:
+                msg.message.options.aggregate === 'integral'
+                    ? msg.message.options.integralInterpolation || 'none'
+                    : undefined,
+            removeBorderValues: msg.message.options.removeBorderValues || false,
+            round: 0,
+        };
+
+        await this.getHistoryV3Continue(msg, id, options, logId, startTime);
+    }
+
+    /** Second half of getHistoryV3 (options normalization) */
+    private async getHistoryV3Continue(
+        msg: ioBroker.Message,
+        id: string | undefined,
+        options: GetHistoryOptions,
+        logId: string,
+        startTime: number,
+    ): Promise<void> {
+        if (!options.count || isNaN(options.count)) {
+            if (options.aggregate === 'none' || options.aggregate === 'onchange') {
+                options.count = options.limit;
+            } else {
+                options.count = 500;
+            }
+        }
+
+        try {
+            if (options.start && typeof options.start !== 'number') {
+                options.start = new Date(options.start).getTime();
+            }
+            if (options.end && typeof options.end !== 'number') {
+                options.end = new Date(options.end).getTime();
+            }
+        } catch (error) {
+            return this.sendTo(
+                msg.from,
+                msg.command,
+                { error: `Invalid call. Invalid date in options: ${formatError(error)}` },
+                msg.callback,
+            );
+        }
+
+        if (!options.start && options.count) {
+            options.returnNewestEntries = true;
+        }
+
+        if (
+            msg.message.options.round !== null &&
+            msg.message.options.round !== undefined &&
+            msg.message.options.round !== ''
+        ) {
+            msg.message.options.round = parseInt(msg.message.options.round, 10);
+            if (!isFinite(msg.message.options.round) || msg.message.options.round < 0) {
+                options.round = this.config.round as number;
+            } else {
+                options.round = Math.pow(10, parseInt(msg.message.options.round, 10));
+            }
+        } else {
+            options.round = this.config.round as number;
+        }
+
+        if (id) {
+            this._influxDPs[id] ||= {} as SavedInfluxDbCustomConfig;
+            this._influxDPs[id].enableDebugLogs = !!msg.message.options.enableDebugLogs;
+            this._influxDPs[id].config ||= '{}';
+        }
+        const debugLog = (id && !!this._influxDPs[id]?.enableDebugLogs) || this.config.enableDebugLogs;
+
+        if (id && this._aliasMap[id]) {
+            id = this._aliasMap[id];
+        }
+
+        if ((options.aggregate === 'percentile' && options.percentile! < 0) || options.percentile! > 100) {
+            options.percentile = 50;
+        }
+        if ((options.aggregate === 'quantile' && options.quantile! < 0) || options.quantile! > 1) {
+            options.quantile = 0.5;
+        }
+        if (
+            options.aggregate === 'integral' &&
+            (typeof options.integralUnit !== 'number' || options.integralUnit <= 0)
+        ) {
+            options.integralUnit = 60;
+        }
+        if (!options.start && !options.count) {
+            options.start = options.end! - 86400000; // - 1 day
+        }
+        if (options.start! > options.end!) {
+            const _end = options.end;
+            options.end = options.start;
+            options.start = _end;
+        }
+
+        if (debugLog) {
+            this.log.debug(`${logId} getHistory (InfluxDB3) call: ${JSON.stringify(options)}`);
+        }
+
+        await this.getHistoryV3Query(msg, id, options, logId, startTime, debugLog);
+    }
+
+    /** SQL query part of getHistoryV3 */
+    private async getHistoryV3Query(
+        msg: ioBroker.Message,
+        id: string | undefined,
+        options: GetHistoryOptions,
+        logId: string,
+        startTime: number,
+        debugLog: boolean,
+    ): Promise<void> {
+        let resultsFromInfluxDB =
+            !msg.message.useAdapter &&
+            options.aggregate !== 'onchange' &&
+            options.aggregate !== 'none' &&
+            options.aggregate !== 'minmax' &&
+            !(options.aggregate === 'integral' && options.integralInterpolation === 'linear');
+
+        if (resultsFromInfluxDB) {
+            if (!options.step) {
+                options.step = Math.round((options.end! - options.start!) / options.count!);
+            }
+            if (options.start) {
+                options.start -= options.step;
+            }
+            options.end! += options.step;
+            options.limit! += 2;
+        }
+
+        options.preAggregated = !resultsFromInfluxDB;
+
+        const safeId = escapeSqlIdentifier(id);
+        let aggregateExpr = 'value';
+        switch (options.aggregate) {
+            case 'average':
+                aggregateExpr = 'AVG(value)';
+                break;
+            case 'max':
+                aggregateExpr = 'MAX(value)';
+                break;
+            case 'min':
+                aggregateExpr = 'MIN(value)';
+                break;
+            case 'total':
+                aggregateExpr = 'SUM(value)';
+                break;
+            case 'count':
+                aggregateExpr = 'COUNT(value)';
+                break;
+            default:
+                // percentile/quantile/linear integral and everything non-numeric: client-side
+                aggregateExpr = 'value';
+                resultsFromInfluxDB = false;
+                break;
+        }
+
+        try {
+            const storedCount = await this.storeBufferedSeries(id);
+            setTimeout(
+                async () => {
+                    if (!this._client) {
+                        sendResponse(this, msg, id, options, 'Database no longer connected', startTime);
+                        return;
+                    }
+                    try {
+                        type SqlRow = {
+                            val?: number;
+                            value?: number;
+                            time: string | number | Date;
+                            q?: number;
+                            from?: string;
+                            ack?: boolean | number;
+                        };
+                        let rows: SqlRow[] = [];
+
+                        if (resultsFromInfluxDB && options.step) {
+                            // DATE_BIN buckets the time axis - the InfluxDB 3 equivalent of
+                            // InfluxQL's GROUP BY time(...) fill(previous)
+                            const sql =
+                                `SELECT ${aggregateExpr} AS val, ` +
+                                `DATE_BIN(INTERVAL '${options.step} MILLISECONDS', time) AS time ` +
+                                `FROM "${safeId}" ` +
+                                `WHERE time > '${new Date(options.start!).toISOString()}' AND ` +
+                                `time < '${new Date(options.end!).toISOString()}' ` +
+                                `GROUP BY DATE_BIN(INTERVAL '${options.step} MILLISECONDS', time) ` +
+                                `ORDER BY time ASC LIMIT ${options.limit}`;
+                            if (debugLog) {
+                                this.log.debug(`${logId} History-SQL to execute: ${sql}`);
+                            }
+                            rows = await this._client.query<SqlRow>(sql);
+                        } else {
+                            const where: string[] = [`time < '${new Date(options.end!).toISOString()}'`];
+                            if (options.start) {
+                                where.unshift(`time > '${new Date(options.start).toISOString()}'`);
+                            }
+                            const desc =
+                                (!options.start && options.count) ||
+                                (options.aggregate === 'none' && options.count && options.returnNewestEntries);
+                            const sql =
+                                `SELECT value AS val, time, ack, q, "from" FROM "${safeId}" ` +
+                                `WHERE ${where.join(' AND ')} ` +
+                                `ORDER BY time ${desc ? 'DESC' : 'ASC'} LIMIT ${options.count}`;
+                            if (debugLog) {
+                                this.log.debug(`${logId} History-SQL to execute: ${sql}`);
+                            }
+                            rows = await this._client.query<SqlRow>(sql);
+                        }
+
+                        this.setConnected(true);
+                        if (debugLog) {
+                            this.log.debug(`${logId} Response rows: ${JSON.stringify(rows)}`);
+                        }
+
+                        this.getHistoryV3Respond(msg, id, options, startTime, rows);
+                    } catch (error) {
+                        if (this._client.getHostsAvailable() === 0) {
+                            this.setConnected(false);
+                        }
+                        this.log.error(`getHistory: ${formatError(error)}`);
+                        sendResponse(this, msg, id, options, formatError(error), startTime);
+                    }
+                },
+                storedCount ? 50 : 0,
+            );
+        } catch (error) {
+            this.log.info(`Error storing buffered series for ${id} before GetHistory: ${formatError(error)}`);
+        }
+    }
+
+    /** Map the SQL rows of getHistoryV3 into ioBroker history entries and answer the message */
+    private getHistoryV3Respond(
+        msg: ioBroker.Message,
+        id: string | undefined,
+        options: GetHistoryOptions,
+        startTime: number,
+        rows: Array<{
+            val?: number;
+            value?: number;
+            time: string | number | Date;
+            q?: number;
+            from?: string;
+            ack?: boolean | number;
+        }>,
+    ): void {
+        const result: IobDataEntry[] = [];
+        if (rows?.length) {
+            for (const storedItem of rows) {
+                const item: IobDataEntry = {
+                    ts: 0,
+                    val: null,
+                };
+                if (storedItem.val !== undefined) {
+                    item.val = storedItem.val;
+                } else if (storedItem.value !== undefined) {
+                    item.val = storedItem.value;
+                }
+                if (storedItem.time) {
+                    item.ts = new Date(storedItem.time).getTime();
+                }
+                if (storedItem.from) {
+                    item.from = storedItem.from;
+                }
+                if (storedItem.ack !== undefined) {
+                    item.ack = storedItem.ack === true || storedItem.ack === 1;
+                }
+                if (storedItem.q !== undefined) {
+                    item.q = storedItem.q;
+                }
+                result.push(item);
+            }
+            result.sort(sortByTs);
+        }
+
+        try {
+            sendResponse(this, msg, id, options, result, startTime);
+        } catch (e) {
+            sendResponse(this, msg, id, options, e.toString(), startTime);
+        }
+    }
+
     async getHistoryV2(msg: ioBroker.Message): Promise<void> {
         const startTime = Date.now();
 
@@ -3744,6 +4194,17 @@ ${!this.config.usetags ? '|> pivot(rowKey:["_time"], columnKey: ["_field"], valu
             return (rows || []).map(row => row.name).filter(name => !!name);
         }
 
+        if (this.config.dbversion === '3.x') {
+            // InfluxDB 3: tables are listed via SQL. Internal/system tables are filtered out,
+            // only the ioBroker datapoint tables (quoted identifiers) remain.
+            const rows = await this._client.query<{ table_name?: string; table?: string; tables?: string }>(
+                'SHOW TABLES',
+            );
+            return (rows || [])
+                .map(row => row.table_name || row.table || row.tables || '')
+                .filter(name => !!name && !name.startsWith('system') && !name.startsWith('_'));
+        }
+
         // `schema.measurements` only looks at the last 30 days by default, so a datapoint whose logging
         // was stopped earlier would be missing - the whole range InfluxDB can store must be scanned
         const rows = await this._client.query<{ _value: string }>(
@@ -3829,7 +4290,22 @@ ${!this.config.usetags ? '|> pivot(rowKey:["_time"], columnKey: ["_field"], valu
         let countQuery: string;
         let dataQuery: string;
 
-        if (this.config.dbversion === '1.x') {
+        if (this.config.dbversion === '3.x') {
+            const safeId = escapeSqlIdentifier(id);
+            const conditions: string[] = [];
+            if (options.start !== undefined) {
+                conditions.push(`time >= '${new Date(options.start).toISOString()}'`);
+            }
+            if (options.end !== undefined) {
+                conditions.push(`time <= '${new Date(options.end).toISOString()}'`);
+            }
+            const where = conditions.length ? ` WHERE ${conditions.join(' AND ')}` : '';
+
+            countQuery = `SELECT COUNT(value) AS total FROM "${safeId}"${where}`;
+            dataQuery =
+                `SELECT * FROM "${safeId}"${where} ORDER BY time ${options.sort === 'asc' ? 'ASC' : 'DESC'}` +
+                ` LIMIT ${options.limit} OFFSET ${options.offset}`;
+        } else if (this.config.dbversion === '1.x') {
             const safeId = escapeInfluxQLIdentifier(id);
             const conditions: string[] = [];
             if (options.start !== undefined) {
