@@ -128,6 +128,8 @@ describe('Test InfluxDB 3 HTTP client', function () {
     let received = [];
     /** response the stub server sends: {status, body, delay} */
     let respond = { status: 204, body: '' };
+    /** when set, the server answers the probe query (SELECT 1) with 200 and everything else with 405 */
+    let respondProbe = false;
     let server;
     let port;
 
@@ -137,6 +139,12 @@ describe('Test InfluxDB 3 HTTP client', function () {
             req.on('data', chunk => (body += chunk));
             req.on('end', () => {
                 received.push({ method: req.method, url: req.url, headers: req.headers, body });
+                if (respondProbe && body.includes('SELECT 1')) {
+                    res.statusCode = 200;
+                    res.setHeader('Content-Type', 'application/json');
+                    res.end(JSON.stringify({ results: [] }));
+                    return;
+                }
                 setTimeout(() => {
                     res.statusCode = respond.status;
                     res.setHeader('Content-Type', 'application/json');
@@ -155,6 +163,7 @@ describe('Test InfluxDB 3 HTTP client', function () {
     beforeEach(function () {
         received = [];
         respond = { status: 204, body: '' };
+        respondProbe = false;
     });
 
     function makeClient(requestTimeout = 1000) {
@@ -253,6 +262,18 @@ describe('Test InfluxDB 3 HTTP client', function () {
         assert.ok(rows[0].time instanceof Date);
         assert.strictEqual(received[0].method, 'POST');
         assert.ok(received[0].url.startsWith('/api/v3/query_sql'));
+    });
+
+    it('falls back to the probe query when database listing is not implemented', async function () {
+        // The SQL dialect of InfluxDB 3 Core does not implement SHOW DATABASES - the server
+        // answers 405 for both listing variants, but the probe query succeeds -> the configured
+        // database counts as existing
+        respondProbe = true;
+        // The listing variants must fail like on a real InfluxDB 3 Core (HTTP 405 "not implemented")
+        respond = { status: 405, body: 'This feature is not implemented: Unsupported SQL statement: SHOW DATABASES' };
+        const client = makeClient();
+        const names = await client.getDatabaseNames();
+        assert.deepStrictEqual(names, ['iobroker']);
     });
 
     it('never logs the token', async function () {

@@ -46,6 +46,12 @@ Begründung:
   `percentile`/`quantile`/linear-`integral` und nicht-numerische Werte aggregiert `@iobroker/aggregate`
   clientseitig (wie bei 1.x/2.x).
 - Tabellenliste: `SHOW TABLES` (interne `system.*`-Tabellen werden gefiltert).
+- Datenbank-Liste: `SHOW DATABASES` ist im SQL-Dialekt von InfluxDB 3 Core nicht implementiert
+  (HTTP 405). Der Adapter versucht daher nacheinander: `system.databases` (Systemtabelle),
+  `SHOW DATABASES` (neuere Versionen) und zuletzt eine Probe-Query im Kontext der konfigurierten
+  Datenbank (Erfolg = vorhanden, HTTP 404 = fehlt). Das Anlegen der Datenbank versucht es analog
+  über SQL `CREATE DATABASE` und die Management-API; falls beides nicht unterstützt wird, weist
+  eine lesbare Fehlermeldung auf `influxdb3 create database` auf dem Server hin.
 
 ## Authentication
 

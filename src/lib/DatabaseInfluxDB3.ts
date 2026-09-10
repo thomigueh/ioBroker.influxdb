@@ -68,7 +68,7 @@ export default class DatabaseInfluxDB3 extends Database {
     private async request(
         path: string,
         init: {
-            method: 'GET' | 'POST';
+            method: 'GET' | 'POST' | 'DELETE';
             body?: string;
             contentType?: string;
             params?: { [key: string]: string };
@@ -198,18 +198,79 @@ export default class DatabaseInfluxDB3 extends Database {
     }
 
     async getDatabaseNames(): Promise<string[]> {
-        const rows = await this.query<Record<string, string>>('SHOW DATABASES');
-        return rows.map(row => row.database_name || row.Database || row.name || '').filter(name => !!name);
+        // The SQL dialect of InfluxDB 3 Core does not implement SHOW DATABASES (HTTP 405
+        // "This feature is not implemented"). Fall back through the supported variants:
+        // 1. the system table `system.databases`, 2. SHOW DATABASES (may work on newer
+        // versions), 3. prove the configured database exists with a probe query.
+        const candidates = ['SELECT database_name AS name FROM system.databases', 'SHOW DATABASES'];
+        let lastError: unknown = null;
+        for (const candidate of candidates) {
+            try {
+                const rows = await this.query<Record<string, string>>(candidate);
+                return rows.map(row => row.name || row.database_name || row.Database || '').filter(name => !!name);
+            } catch (error) {
+                lastError = error;
+                this.log.debug(
+                    `InfluxDB 3: database listing via "${candidate}" failed: ${formatError(error)} - trying the next variant`,
+                );
+            }
+        }
+
+        // Last resort: the probe query runs in the context of the configured database. A success
+        // proves that it exists, a 404 proves that it does not.
+        try {
+            await this.query('SELECT 1');
+            this.log.debug(
+                'InfluxDB 3: database listing is not supported by this server version - assuming the configured database exists (probe query succeeded)',
+            );
+            return [this.database];
+        } catch (error) {
+            if ((error as { statusCode?: number }).statusCode === 404) {
+                return [];
+            }
+            throw lastError ?? error;
+        }
     }
 
     async createDatabase(dbname: string): Promise<void> {
         this.log.info(`Creating database ${dbname}`);
-        await this.query(`CREATE DATABASE "${escapeSqlIdentifier(dbname)}"`);
+        try {
+            await this.query(`CREATE DATABASE "${escapeSqlIdentifier(dbname)}"`);
+            return;
+        } catch (sqlError) {
+            this.log.debug(`InfluxDB 3: CREATE DATABASE via SQL failed: ${formatError(sqlError)}`);
+        }
+        try {
+            // management API of newer Core/Enterprise versions
+            await this.request('/api/v3/databases', {
+                method: 'POST',
+                body: JSON.stringify({ db: dbname }),
+                contentType: 'application/json',
+                okStatuses: [200, 201, 204],
+            });
+            return;
+        } catch (apiError) {
+            this.log.debug(`InfluxDB 3: database creation via management API failed: ${formatError(apiError)}`);
+        }
+        throw new Error(
+            `Could not create database "${dbname}": neither SQL CREATE DATABASE nor the management API are ` +
+                `supported by this server. Please create it manually on the server, e.g.: influxdb3 create database ${dbname}`,
+        );
     }
 
     async dropDatabase(dbname: string): Promise<void> {
         this.log.info(`Dropping database ${dbname}`);
-        await this.query(`DROP DATABASE "${escapeSqlIdentifier(dbname)}"`);
+        try {
+            await this.query(`DROP DATABASE "${escapeSqlIdentifier(dbname)}"`);
+            return;
+        } catch (sqlError) {
+            this.log.debug(`InfluxDB 3: DROP DATABASE via SQL failed: ${formatError(sqlError)}`);
+        }
+        // management API of newer Core/Enterprise versions
+        await this.request(`/api/v3/databases/${encodeURIComponent(dbname)}`, {
+            method: 'DELETE',
+            okStatuses: [200, 204],
+        });
     }
 
     applyRetentionPolicyToDB(dbName: string, retention: number): Promise<void> {
