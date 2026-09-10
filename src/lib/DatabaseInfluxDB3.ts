@@ -1,5 +1,5 @@
 import { Database, type ValuesForInflux } from './Database';
-import { escapeSqlIdentifier, seriesToLineProtocol, stateValueToLineProtocol } from './lineProtocol';
+import { escapeSqlIdentifier, seriesToLineProtocol, stateValueToLineProtocol, tableNameForId } from './lineProtocol';
 import { formatError } from './errors';
 
 /**
@@ -313,7 +313,12 @@ export default class DatabaseInfluxDB3 extends Database {
     }
 
     async writeSeries(series: { [id: string]: ValuesForInflux[] }): Promise<void> {
-        const { body, count } = seriesToLineProtocol(series);
+        // the ioBroker ids are mapped to Grafana-friendly table names (see tableNameForId)
+        const mapped: { [id: string]: ValuesForInflux[] } = {};
+        for (const [id, points] of Object.entries(series)) {
+            mapped[tableNameForId(id)] = points;
+        }
+        const { body, count } = seriesToLineProtocol(mapped);
         if (!count) {
             return;
         }
@@ -323,7 +328,7 @@ export default class DatabaseInfluxDB3 extends Database {
 
     async writePoints(seriesId: string, pointsToSend: ValuesForInflux[]): Promise<void> {
         this.log.debug(`InfluxDB 3: writing ${pointsToSend.length} points for ${seriesId}`);
-        const { body, count } = seriesToLineProtocol({ [seriesId]: pointsToSend });
+        const { body, count } = seriesToLineProtocol({ [tableNameForId(seriesId)]: pointsToSend });
         if (!count) {
             return;
         }
@@ -332,7 +337,7 @@ export default class DatabaseInfluxDB3 extends Database {
 
     async writePoint(seriesId: string, value: ValuesForInflux): Promise<void> {
         this.log.debug(`InfluxDB 3: writing 1 point for ${seriesId}`);
-        await this.writeLineProtocol(stateValueToLineProtocol(seriesId, value), 1);
+        await this.writeLineProtocol(stateValueToLineProtocol(tableNameForId(seriesId), value), 1);
     }
 
     /**

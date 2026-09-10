@@ -10,11 +10,21 @@ Das bestehende Schema der 1.x-/2.x-Implementierungen wird 1:1 übernommen:
 ```
 ioBroker State
       ↓
-Tabelle (Measurement) = die komplette ioBroker-ID, z. B. "0_userdata.0.Wetterstation.Temperatur"
+Tabelle (Measurement) = die ioBroker-ID mit bereinigten Zeichen (tableNameForId),
+                       z. B. "0_userdata_0_Wetterstation_Temperatur"
 Fields                = value (number|boolean|string), q (int), ack (boolean), from (string)
 Timestamp             = state.ts in Millisekunden (Write mit precision=ms)
 Tags                  = keine (q/ack/from sind Spalten/Fields, wie beim 2.x-Default)
 ```
+
+Die ioBroker-IDs enthalten Punkte (`0_userdata.0.Temperatur`). Als SQL-Tabellennamen wären sie
+ zwar gültig, aber Grafana bricht daran: Der Tabellen-Picker zeigt den Namen bereits gequotet an
+ und beim Einfügen in den SQL-Editor entsteht `FROM "" 0_userdata.0.temp ""` - ungültiges SQL.
+Daher bildet `tableNameForId()` für InfluxDB 3 jedes Zeichen, das nicht alphanumerisch oder `_`
+ist, auf `_` ab. Die Transformation ist idempotent und deterministisch, so dass Schreiben und
+Lesen immer dieselbe Tabelle treffen. Trade-off: zwei verschiedene IDs können auf denselben
+Tabellennamen mappen (z. B. `a.b` und `a_b`) - abgewogen gegen die deutlich bessere
+Grafana-/SQL-Benutzbarkeit.
 
 Begründung:
 

@@ -7,7 +7,7 @@ import DatabaseInfluxDB1x from './lib/DatabaseInfluxDB1x';
 import DatabaseInfluxDB2x from './lib/DatabaseInfluxDB2x';
 import DatabaseInfluxDB3 from './lib/DatabaseInfluxDB3';
 import { escapeFluxString, escapeInfluxQLIdentifier, type Database, type ValuesForInflux } from './lib/Database';
-import { escapeSqlIdentifier } from './lib/lineProtocol';
+import { escapeSqlIdentifier, tableNameForId } from './lib/lineProtocol';
 import { formatError, HostUnavailableError, isConnectionError, UnstorableValueError } from './lib/errors';
 import type {
     GetHistoryOptions,
@@ -2022,7 +2022,7 @@ datasources:
                 throw error;
             }
         } else if (this.config.dbversion === '3.x') {
-            const safeId = escapeSqlIdentifier(id);
+            const safeId = escapeSqlIdentifier(tableNameForId(id));
             let query;
             if (state.ts) {
                 query = `DELETE FROM "${safeId}" WHERE time = '${new Date(state.ts).toISOString()}'`;
@@ -2381,7 +2381,7 @@ datasources:
                 throw error;
             }
         } else if (this.config.dbversion === '3.x') {
-            const query = `SELECT * FROM "${escapeSqlIdentifier(id)}" WHERE time = '${new Date(state.ts).toISOString()}'`;
+            const query = `SELECT * FROM "${escapeSqlIdentifier(tableNameForId(id))}" WHERE time = '${new Date(state.ts).toISOString()}'`;
 
             try {
                 const result = await this._client?.query<{
@@ -3340,7 +3340,7 @@ datasources:
 
         options.preAggregated = !resultsFromInfluxDB;
 
-        const safeId = escapeSqlIdentifier(id);
+        const safeId = escapeSqlIdentifier(tableNameForId(id || ''));
         let aggregateExpr = 'value';
         switch (options.aggregate) {
             case 'average':
@@ -4196,12 +4196,14 @@ ${!this.config.usetags ? '|> pivot(rowKey:["_time"], columnKey: ["_field"], valu
 
         if (this.config.dbversion === '3.x') {
             // InfluxDB 3: tables are listed via SQL. Internal/system tables are filtered out,
-            // only the ioBroker datapoint tables (quoted identifiers) remain.
+            // only the ioBroker datapoint tables remain. DataFusion may return the identifier
+            // already double-quoted (names with special characters) - strip the quotes, the
+            // names are the sanitized ioBroker ids (see tableNameForId).
             const rows = await this._client.query<{ table_name?: string; table?: string; tables?: string }>(
                 'SHOW TABLES',
             );
             return (rows || [])
-                .map(row => row.table_name || row.table || row.tables || '')
+                .map(row => (row.table_name || row.table || row.tables || '').replace(/^"(.*)"$/, '$1'))
                 .filter(name => !!name && !name.startsWith('system') && !name.startsWith('_'));
         }
 
@@ -4270,7 +4272,10 @@ ${!this.config.usetags ? '|> pivot(rowKey:["_time"], columnKey: ["_field"], valu
 
         const result: { id: string; type: StorageType | null }[] = [];
         for (const id of measurements.sort((a, b) => a.localeCompare(b))) {
-            result.push({ id, type: await this.getStorageType(id) });
+            // the table names are the sanitized ioBroker ids (tableNameForId) - resolve them back
+            // to the logged datapoint so its storageType is found
+            const loggedId = Object.keys(this._influxDPs).find(mid => tableNameForId(mid) === id) || id;
+            result.push({ id, type: await this.getStorageType(loggedId) });
         }
 
         this.sendTo(msg.from, msg.command, { success: true, result }, msg.callback);
@@ -4291,7 +4296,7 @@ ${!this.config.usetags ? '|> pivot(rowKey:["_time"], columnKey: ["_field"], valu
         let dataQuery: string;
 
         if (this.config.dbversion === '3.x') {
-            const safeId = escapeSqlIdentifier(id);
+            const safeId = escapeSqlIdentifier(tableNameForId(id));
             const conditions: string[] = [];
             if (options.start !== undefined) {
                 conditions.push(`time >= '${new Date(options.start).toISOString()}'`);

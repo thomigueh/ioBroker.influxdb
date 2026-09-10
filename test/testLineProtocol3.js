@@ -10,6 +10,7 @@ const {
     seriesToLineProtocol,
     escapeSqlIdentifier,
     escapeSqlString,
+    tableNameForId,
 } = require('../build/lib/lineProtocol');
 const DatabaseInfluxDB3 = require('../build/lib/DatabaseInfluxDB3').default;
 
@@ -46,6 +47,22 @@ describe('Test line protocol escaping', function () {
     it('escapes identifiers and strings for SQL quoting', function () {
         assert.strictEqual(escapeSqlIdentifier('0_userdata.0."quoted"'), '0_userdata.0.""quoted""');
         assert.strictEqual(escapeSqlString("it's"), "it''s");
+    });
+});
+
+describe('Test table name mapping for InfluxDB 3', function () {
+    it('maps ioBroker ids to Grafana-friendly table names', function () {
+        assert.strictEqual(tableNameForId('0_userdata.0.Wetterstation.Temperatur'), '0_userdata_0_Wetterstation_Temperatur');
+    });
+
+    it('is idempotent', function () {
+        const once = tableNameForId('0_userdata.0.Wetterstation.Temperatur');
+        assert.strictEqual(tableNameForId(once), once);
+    });
+
+    it('removes all characters that break SQL identifiers or the Grafana picker', function () {
+        const name = tableNameForId('0_userdata.0."temperatur (°C)"');
+        assert.ok(!name.includes('.') && !name.includes('"') && !name.includes(' '), name);
     });
 });
 
@@ -191,7 +208,8 @@ describe('Test InfluxDB 3 HTTP client', function () {
         assert.ok(req.url.includes('db=iobroker'), req.url);
         assert.ok(req.url.includes('precision=ms'), req.url);
         assert.strictEqual(req.headers.authorization, 'Bearer secret-test-token');
-        assert.ok(req.body.includes('my.datapoint value=21.7'), req.body);
+        // the id is mapped to a Grafana-friendly table name (dots etc. become _)
+        assert.ok(req.body.includes('my_datapoint value=21.7'), req.body);
         assert.ok(req.body.endsWith('1757520000000'), req.body);
     });
 

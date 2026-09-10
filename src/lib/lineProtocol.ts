@@ -104,6 +104,21 @@ export function escapeSqlIdentifier(id: string | undefined): string {
 }
 
 /**
+ * InfluxDB 3 table name for an ioBroker state id.
+ *
+ * Decision (documented in docs/influxdb3.md): the 1.x/2.x implementations use the raw ioBroker id
+ * as measurement. Table names with dots are valid in InfluxDB 3, but Grafana's SQL table picker
+ * and identifier insertion break on them (the quoted name ends up double-quoted in the SQL
+ * editor), so for 3.x every character that is not alphanumeric or `_` becomes `_`.
+ * The transformation is idempotent and deterministic, so writes and reads always map to the same
+ * table. Trade-off: two different ids can map to the same table name (e.g. "a.b" and "a_b") -
+ * acceptable for the readability gain in Grafana/SQL.
+ */
+export function tableNameForId(id: string): string {
+    return id.replace(/[^a-zA-Z0-9_]/g, '_');
+}
+
+/**
  * Escape a string literal that is placed inside single quotes in an SQL query for InfluxDB 3.
  */
 export function escapeSqlString(value: string | undefined): string {
